@@ -13,17 +13,19 @@ Send NTP request and receive current time.
 #include <string.h>
 #include <netdb.h>
 #include <time.h>
+#include <unistd.h>
 
 //NTP Packet header
 #define PORTNUM 123
-#define LI 0
-#define VN 3
-#define MODE 3
-#define STRATUM 0
-#define POLL 4
-#define PREC -6
+#define LI 0x03
+#define VN 0x04
+#define MODE 0x03
+#define STRATUM 0x00
+#define POLL 0x04
+#define PREC 0xfa
 
 #define NTP_LEN 48
+#define NTP_LEN_RCV 384
 #define JAN_1970 0x83aa7e80
 #define NTPFRAC(x) (4294*(x)+((1981*(x))>>11))
 #define USEC(x) (((x)>>12-759*((((X)>>10)+32768)>>16))
@@ -44,7 +46,7 @@ struct ntppacket
 	//8bits Poll(with signed)
 	int8_t poll;
 	//8Bits Precision(with signed)
-	int8_t precision;
+	uint8_t precision;
 	//32bits root delay(with signed)
 	int32_t root_delay;
 	//32bits root dispersion
@@ -61,56 +63,86 @@ struct ntppacket
 	struct ntptime transmit_timestamp;
 };
 
+struct sockpack
+{
+	int32_t fd;
+	struct sockaddr_in s_sockaddr;
+};
+
 //This function build a entire NTP client packet
-void Build_Packet(struct ntppacket* packet);
+void Build_Packet(struct ntppacket* packet, uint8_t *data);
 //Initialize a socket
-int32_t  Init_Soacket(int para, char *str[], struct sockaddr_in server_sockaddr);
+struct sockpack  Init_Soacket(int para, char *str[]);
 //Send the initial packet
-void Send_NTP_Packet(struct ntppacket* packet, int32_t size, int32_t clientfd, struct sockaddr_in server_sockaddr);
+void Send_NTP_Packet(uint8_t *data, int32_t size, int32_t clientfd, struct sockaddr_in server_sockaddr);
 //Receive the data that server returned
-void Receive_NTP_Packet(struct ntppacket* packet, int32_t size, int32_t clientfd, struct sockaddr_in server_sockaddr);
+void Receive_NTP_Packet(uint8_t *data, int32_t *size, int32_t clientfd, struct sockaddr_in server_sockaddr);
 
 int main(int argc, char *argv[])
 {
-	struct ntppacket sdpacket,rcvpacket;
-	struct sockaddr_in s_sockaddr;
-	int32_t fd,sin_size;;
-	Build_Packet(&sdpacket);
-	fd = Init_Soacket(argc,argv,s_sockaddr);
+	struct ntppacket *sdpacket,*rcvpacket;
+	struct sockpack sdpack;
+	uint8_t sddata[NTP_LEN],rcvdata[NTP_LEN*8];
+	int32_t sin_size;
+
+	sdpacket = (struct ntppacket *)malloc(sizeof(struct ntppacket));
+	rcvpacket = (struct ntppacket *)malloc(sizeof(struct ntppacket));
+	Build_Packet(sdpacket,sddata);
+	sdpack = Init_Soacket(argc,argv);
 	sin_size = sizeof(struct sockaddr);
-	Send_NTP_Packet(&sdpacket,sin_size,fd,s_sockaddr);
-	Receive_NTP_Packet(&rcvpacket,sin_size,fd,s_sockaddr);
+	Send_NTP_Packet(sddata,sin_size,sdpack.fd,sdpack.s_sockaddr);
+	Receive_NTP_Packet(rcvdata,&sin_size,sdpack.fd,sdpack.s_sockaddr);
 	//close
-	close(fd);
+	close(sdpack.fd);
 	exit(0);
 }
 
 
-void Build_Packet(struct ntppacket* packet)
+void Build_Packet(struct ntppacket* packet, uint8_t *data)
 {
 	time_t time_Local;
+	uint32_t temp;
 	//header
-	packet->li_vn_mode = htonl((LI<<6)|(VN<<3)|MODE);
-	packet->stratum = htonl(STRATUM);
-	packet->poll = htonl(POLL);
-	packet->precision = htonl(PREC&0xff);
+	packet->li_vn_mode = (uint8_t)((uint8_t)MODE|(uint8_t)(VN<<3)|(uint8_t)(LI<<6));
+	packet->stratum = (uint8_t)STRATUM;
+	packet->poll = (int8_t)POLL;
+	packet->precision = (uint8_t)PREC;
 
-	packet->root_delay = htonl(1<<16);
-	packet->root_dispersion = htonl(1<<16);
+	packet->root_delay = (int32_t)(1<<16);
+	packet->root_dispersion = (int32_t)(1<<16);
 	packet->reference_identifier = 0;
 
 	//no need to set other three time stamps, just stay zero
 	time(&time_Local);
-	packet->transmit_timestamp.coarse = htonl(JAN_1970+time_Local);
-	packet->transmit_timestamp.fine = htonl(NTPFRAC(time_Local));
+	packet->transmit_timestamp.coarse = (int32_t)(JAN_1970+time_Local);
+	packet->transmit_timestamp.fine = (int32_t)(NTPFRAC(time_Local));
+
+	//build packet
+	temp = htonl(((packet -> li_vn_mode) << 24)|((packet -> stratum) << 16)|((packet -> poll) << 8)|(packet -> precision));
+	memcpy(data,&temp,sizeof(temp));
+	temp = htonl(packet->root_delay);
+	memcpy(data+4,&temp,sizeof(temp));
+	temp = htonl(packet->root_dispersion);
+	memcpy(data+8,&temp,sizeof(temp));
+	temp = htonl(packet->reference_identifier);
+	memcpy(data+12,&temp,sizeof(temp));
+	temp = htonl(packet->transmit_timestamp.coarse);
+	memcpy(data+40,&temp,sizeof(temp));
+	temp = htonl(packet->transmit_timestamp.fine);
+	memcpy(data+44,&temp,sizeof(temp));
 
 }
 
-int32_t Init_Soacket(int para, char *str[], struct sockaddr_in server_sockaddr)
+struct sockpack Init_Soacket(int para, char *str[])
 {
 	int32_t clientfd;
-	struct hostent *host;
-	struct in_addr aimaddr;
+	struct sockaddr_in server_sockaddr;
+	struct sockpack sdpack;
+	//struct hostent *host;
+	//struct in_addr aimaddr;
+
+	//initialize the sockaddr
+	memset(&server_sockaddr,0,sizeof(struct sockaddr_in));
 
 	//obtain host name/IP from argv
 	if(para != 2)
@@ -130,40 +162,69 @@ int32_t Init_Soacket(int para, char *str[], struct sockaddr_in server_sockaddr)
 	}*/
 
 	//create a socket
-	if((clientfd = socket(AF_INET,SOCK_DGRAM,0)) == -1)
+	if((clientfd = socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP)) == -1)
 	{
 		fprintf(stderr,"An Error Occured:%s, Create Failed!\n",strerror(errno));
 		exit(1);
 	}
 
-	//initialize the sockaddr
-	memset(&server_sockaddr,0,sizeof(struct sockaddr_in));
-
 	//fill the sockaddr with server information that you want to connect
 	server_sockaddr.sin_family = AF_INET;
 	server_sockaddr.sin_port = htons(PORTNUM);
 	/*server_sockaddr.sin_addr = *((struct in_addr *)host->h_addr);*/
-	return(clientfd);
+
+	//return the socket packet
+	sdpack.fd = clientfd;
+	sdpack.s_sockaddr = server_sockaddr;
+	return(sdpack);
 }
 
-void Send_NTP_Packet(struct ntppacket* packet, int32_t size, int32_t clientfd, struct sockaddr_in server_sockaddr)
+void Send_NTP_Packet(uint8_t *data, int32_t size, int32_t clientfd, struct sockaddr_in server_sockaddr)
 {
-	if((sendto(clientfd,packet,sizeof(packet),0,(struct sockaddr*)&server_sockaddr,size) == -1))
+	if((sendto(clientfd,data,NTP_LEN,0,(struct sockaddr*)&server_sockaddr,size) == -1))
 	{
 		fprintf(stderr,"An Error Occurred:%s, Send Failed!\n",strerror(errno));
 		exit(1);
 	}
 	else
-		printf("Send Packet successful!");
+		printf("Send Packet successful!\n");
 }
 
-void Receive_NTP_Packet(struct ntppacket* packet, int32_t size, int32_t clientfd, struct sockaddr_in server_sockaddr)
+void Receive_NTP_Packet(uint8_t *data, int32_t *size, int32_t clientfd, struct sockaddr_in server_sockaddr)
 {
-	if((recvfrom(clientfd,packet,NTP_LEN*8,0,(struct sockaddr*)&server_sockaddr,&size) == -1))
+	struct sockaddr_in client_sockaddr;
+	if((recvfrom(clientfd,data,NTP_LEN*8,0,(struct sockaddr*)&client_sockaddr,size) == -1))
 		{
-			fprintf(stderr,"An Error Occurred:%s, Send Failed!\n",strerror(errno));
+			fprintf(stderr,"An Error Occurred:%s, Receive Failed!\n",strerror(errno));
 			exit(1);
 		}
 		else
-			printf("%a",ntohl(packet->li_vn_mode));
+		{
+			fprintf(stdout,"From %s ",inet_ntoa(client_sockaddr.sin_addr));
+			int32_t temp;
+			memcpy(&temp,data,4);
+			fprintf(stdout,"LI_VN_MODE_strtum_poll_precision:%x\n",ntohl(temp));
+			memcpy(&temp,data+4,4);
+			fprintf(stdout,"root_delay:%x\n",ntohl(temp));
+			memcpy(&temp,data+8,4);
+			fprintf(stdout,"root_dispersion:%x\n",ntohl(temp));
+			memcpy(&temp,data+12,4);
+			fprintf(stdout,"reference_identifier:%x\n",ntohl(temp));
+			memcpy(&temp,data+16,4);
+			fprintf(stdout,"reference_timestamp_coarse:%x\n",ntohl(temp));
+			memcpy(&temp,data+20,4);
+			fprintf(stdout,"reference_timestamp_fine:%x\n",ntohl(temp));
+			memcpy(&temp,data+24,4);
+			fprintf(stdout,"originage_timestamp_coarse:%x\n",ntohl(temp));
+			memcpy(&temp,data+28,4);
+			fprintf(stdout,"originage_timestamp_fine:%x\n",ntohl(temp));
+			memcpy(&temp,data+32,4);
+			fprintf(stdout,"receive_timestamp_coarse:%x\n",ntohl(temp));
+			memcpy(&temp,data+36,4);
+			fprintf(stdout,"receive_timestamp_fine:%x\n",ntohl(temp));
+			memcpy(&temp,data+40,4);
+			fprintf(stdout,"receive_timestamp_coarse:%x\n",ntohl(temp));
+			memcpy(&temp,data+44,4);
+			fprintf(stdout,"receive_timestamp_fine:%x\n",ntohl(temp));
+		}
 }
